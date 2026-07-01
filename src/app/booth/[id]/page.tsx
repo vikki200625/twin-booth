@@ -2,17 +2,9 @@
 
 import { useParams } from "next/navigation"
 import Link from "next/link"
-import { useState, useEffect, useRef, useCallback } from "react"
+import { useState, useEffect, useRef } from "react"
 import { nanoid } from "nanoid"
-import { supabase } from "@/lib/supabase"
-import {
-  createPeerConnection,
-  setupDataChannel,
-  handleDataChannel,
-  createOffer,
-  handleOffer,
-  handleAnswer,
-} from "@/lib/webrtc"
+import Peer, { DataConnection } from "peerjs"
 import { getLocalStream, captureFrame, compositeImages, downloadBlob } from "@/lib/capture"
 import { uploadPhoto, deleteRoom } from "@/lib/storage"
 import WebcamFeed from "@/components/WebcamFeed"
@@ -54,15 +46,18 @@ export default function BoothPage() {
   const [chatMessages, setChatMessages] = useState<{ sender: string; text: string; timestamp: number }[]>([])
   const [myId] = useState(() => nanoid(8))
 
-  const pcRef = useRef<RTCPeerConnection | null>(null)
-  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
-  const dataChannelRef = useRef<RTCDataChannel | null>(null)
-  const roleRef = useRef(role)
-  roleRef.current = role
+  const peerRef = useRef<Peer | null>(null)
+  const connRef = useRef<DataConnection | null>(null)
   const photoIndexRef = useRef(photoIndex)
   photoIndexRef.current = photoIndex
   const localFilterRef = useRef(localFilter)
   localFilterRef.current = localFilter
+
+  function send(data: Record<string, unknown>) {
+    if (connRef.current?.open) {
+      connRef.current.send(data)
+    }
+  }
 
   async function captureLocalFrame(): Promise<Blob | null> {
     const videoEl = document.querySelector('video')
@@ -71,20 +66,31 @@ export default function BoothPage() {
     return captureFrame(videoEl as HTMLVideoElement, filter)
   }
 
-  function sendSignal(msg: Record<string, unknown>) {
-    if (channelRef.current) {
-      channelRef.current.send({
-        type: 'broadcast',
-        event: 'signal',
-        payload: msg,
-      })
-    }
-  }
+  async function performCapture() {
+    const localBlob = await captureLocalFrame()
+    if (!localBlob) return
 
-  function sendChat(text: string) {
-    const msg = { type: "chat", sender: myId, text, timestamp: Date.now() }
-    sendSignal(msg)
-    setChatMessages((prev) => [...prev, { sender: myId, text, timestamp: Date.now() }])
+    const idx = photoIndexRef.current
+    const reader = new FileReader()
+    reader.onload = async () => {
+      const base64 = (reader.result as string).split(",")[1]
+
+      const binary = atob(base64)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i)
+      }
+      const remoteBlob = new Blob([bytes], { type: "image/jpeg" })
+
+      const composite = await compositeImages(localBlob, remoteBlob)
+      const uploadedUrl = await uploadPhoto(roomId, idx, composite)
+      setPhotos((prev) => [
+        ...prev,
+        { index: idx, blob: composite, url: uploadedUrl || URL.createObjectURL(composite) },
+      ])
+      setPhotoIndex(idx + 1)
+    }
+    reader.readAsDataURL(localBlob)
   }
 
   async function handlePhotoMessage(msg: { photoIndex: number; imageData: string }) {
@@ -108,85 +114,8 @@ export default function BoothPage() {
     setCountingActive(false)
   }
 
-  async function performCapture() {
-    const localBlob = await captureLocalFrame()
-    if (!localBlob) return
-
-    const idx = photoIndexRef.current
-    const reader = new FileReader()
-    reader.onload = () => {
-      const base64 = (reader.result as string).split(",")[1]
-      sendSignal({
-        type: "photo",
-        photoIndex: idx,
-        imageData: base64,
-      })
-
-      const binary = atob(base64)
-      const bytes = new Uint8Array(binary.length)
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i)
-      }
-      const remoteBlob = new Blob([bytes], { type: "image/jpeg" })
-
-      compositeImages(localBlob, remoteBlob).then(async (composite) => {
-        const uploadedUrl = await uploadPhoto(roomId, idx, composite)
-        setPhotos((prev) => [
-          ...prev,
-          { index: idx, blob: composite, url: uploadedUrl || URL.createObjectURL(composite) },
-        ])
-        setPhotoIndex(idx + 1)
-      })
-    }
-    reader.readAsDataURL(localBlob)
-  }
-
-  function handleSignalMessage(msg: Record<string, unknown>) {
-    const type = msg.type as string
-
-    if (type === "offer" && roleRef.current === "guest") {
-      ;(async () => {
-        const pc = createPeerConnection()
-        pcRef.current = pc
-
-        pc.ontrack = (e) => {
-          setRemoteStream(e.streams[0])
-        }
-
-        handleDataChannel(pc, (data) => {
-          handleSignalMessage(JSON.parse(data))
-        })
-
-        const answer = await handleOffer(pc, msg.sdp as string)
-        sendSignal({ type: "answer", sdp: answer })
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate) {
-            sendSignal({
-              type: "ice-candidate",
-              candidate: JSON.stringify(e.candidate),
-            })
-          }
-        }
-
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === "connected") {
-            setRoomState("connected")
-          }
-        }
-      })()
-    }
-
-    if (type === "answer" && roleRef.current === "host" && pcRef.current) {
-      handleAnswer(pcRef.current, msg.sdp as string)
-    }
-
-    if (type === "ice-candidate" && pcRef.current) {
-      const candidate = JSON.parse(msg.candidate as string)
-      if (pcRef.current.remoteDescription) {
-        pcRef.current.addIceCandidate(new RTCIceCandidate(candidate))
-      }
-    }
+  function handleMessage(data: Record<string, unknown>) {
+    const type = data.type as string
 
     if (type === "ready") {
       setRoomState("ready")
@@ -201,24 +130,30 @@ export default function BoothPage() {
     }
 
     if (type === "photo") {
-      handlePhotoMessage(msg as { photoIndex: number; imageData: string })
+      handlePhotoMessage(data as { photoIndex: number; imageData: string })
     }
 
     if (type === "chat") {
-      setChatMessages((prev) => [...prev, { sender: msg.sender as string, text: msg.text as string, timestamp: msg.timestamp as number }])
+      setChatMessages((prev) => [...prev, { sender: data.sender as string, text: data.text as string, timestamp: data.timestamp as number }])
     }
+  }
+
+  function sendChat(text: string) {
+    const msg = { type: "chat", sender: myId, text, timestamp: Date.now() }
+    send(msg)
+    setChatMessages((prev) => [...prev, { sender: myId, text, timestamp: Date.now() }])
   }
 
   function handleSnap() {
     setCountingActive(true)
-    sendSignal({ type: "countdown", value: 3 })
+    send({ type: "countdown", value: 3 })
   }
 
   function handleCountdownComplete() {
     setCountingActive(false)
     setRoomState("snapping")
     performCapture()
-    sendSignal({ type: "snap" })
+    send({ type: "snap" })
 
     setTimeout(() => {
       setRoomState("ready")
@@ -228,119 +163,91 @@ export default function BoothPage() {
   async function endSession() {
     await deleteRoom(roomId)
     localStream?.getTracks().forEach((t) => t.stop())
-    pcRef.current?.close()
-    channelRef.current?.unsubscribe()
+    peerRef.current?.destroy()
     setRoomState("done")
     setPhotos([])
   }
 
-  // Setup Supabase channel and handle signaling
+  // Host: create peer and wait for guest
   useEffect(() => {
-    if (!role) return
+    if (role !== "host") return
 
-    const channel = supabase.channel(`room:${roomId}`, {
-      config: { broadcast: { self: false } },
+    const peer = new Peer(roomId, {
+      debug: 1,
+    })
+    peerRef.current = peer
+
+    peer.on("open", (id) => {
+      console.log("Host peer opened with id:", id)
+      setRoomState("waiting")
     })
 
-    channel
-      .on('broadcast', { event: 'signal' }, ({ payload }) => {
-        handleSignalMessage(payload as Record<string, unknown>)
+    peer.on("connection", (conn) => {
+      console.log("Host received connection from guest")
+      connRef.current = conn
+
+      conn.on("open", () => {
+        console.log("Data connection opened (host side)")
+        setRoomState("connected")
       })
-      .subscribe(async (status) => {
-        if (status !== 'SUBSCRIBED') return
 
-        channelRef.current = channel
-
-        if (role === "guest") {
-          setRoomState("connecting")
-          sendSignal({ type: "join", role: "guest" })
-        }
-
-        if (role === "host") {
-          setRoomState("waiting")
-        }
+      conn.on("data", (data) => {
+        handleMessage(data as Record<string, unknown>)
       })
+
+      conn.on("close", () => {
+        console.log("Data connection closed (host side)")
+      })
+    })
+
+    peer.on("error", (err) => {
+      console.error("Host peer error:", err)
+      setError(`Connection error: ${err.message}`)
+    })
 
     return () => {
-      channel.unsubscribe()
-      channelRef.current = null
+      peer.destroy()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role, roomId])
 
-  // Host: listen for guest join and start WebRTC
+  // Guest: connect to host
   useEffect(() => {
-    if (role !== "host") return
+    if (role !== "guest") return
 
-    const channel = supabase.channel(`room:${roomId}`, {
-      config: { broadcast: { self: false } },
+    setRoomState("connecting")
+
+    const peer = new Peer(undefined as unknown as string, {
+      debug: 1,
+    })
+    peerRef.current = peer
+
+    peer.on("open", () => {
+      console.log("Guest peer opened, connecting to host:", roomId)
+      const conn = peer.connect(roomId, { reliable: true })
+      connRef.current = conn
+
+      conn.on("open", () => {
+        console.log("Data connection opened (guest side)")
+        setRoomState("connected")
+      })
+
+      conn.on("data", (data) => {
+        handleMessage(data as Record<string, unknown>)
+      })
+
+      conn.on("close", () => {
+        console.log("Data connection closed (guest side)")
+      })
     })
 
-    let webRTCStarted = false
-
-    channel
-      .on('broadcast', { event: 'signal' }, ({ payload }) => {
-        const msg = payload as Record<string, unknown>
-        if (msg.type === "join" && msg.role === "guest" && !webRTCStarted) {
-          webRTCStarted = true
-          startWebRTC(channel)
-        }
-        handleSignalMessage(msg)
-      })
-      .subscribe(async (status) => {
-        if (status !== 'SUBSCRIBED') return
-        channelRef.current = channel
-        setRoomState("waiting")
-      })
-
-    async function startWebRTC(ch: ReturnType<typeof supabase.channel>) {
-      const pc = createPeerConnection()
-      pcRef.current = pc
-
-      pc.ontrack = (e) => {
-        setRemoteStream(e.streams[0])
-      }
-
-      const dc = setupDataChannel(pc)
-      dataChannelRef.current = dc
-
-      dc.onopen = () => {
-        setRoomState("connected")
-      }
-
-      dc.onmessage = (e) => {
-        handleSignalMessage(JSON.parse(e.data))
-      }
-
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          ch.send({
-            type: 'broadcast',
-            event: 'signal',
-            payload: {
-              type: "ice-candidate",
-              candidate: JSON.stringify(e.candidate),
-            },
-          })
-        }
-      }
-
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "connected") {
-          setRoomState("connected")
-        }
-      }
-
-      const offer = await createOffer(pc)
-      ch.send({
-        type: 'broadcast',
-        event: 'signal',
-        payload: { type: "offer", sdp: offer },
-      })
-    }
+    peer.on("error", (err) => {
+      console.error("Guest peer error:", err)
+      setError(`Connection error: ${err.message}`)
+    })
 
     return () => {
-      channel.unsubscribe()
+      peer.destroy()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role, roomId])
@@ -355,14 +262,8 @@ export default function BoothPage() {
         setLocalStream(stream)
         setRoomState("camera")
 
-        if (pcRef.current) {
-          stream.getTracks().forEach((track) => {
-            pcRef.current!.addTrack(track, stream)
-          })
-        }
-
         if (role === "host") {
-          sendSignal({ type: "ready" })
+          send({ type: "ready" })
           setRoomState("ready")
         }
       } catch {
@@ -378,7 +279,7 @@ export default function BoothPage() {
   useEffect(() => {
     return () => {
       localStream?.getTracks().forEach((t) => t.stop())
-      pcRef.current?.close()
+      peerRef.current?.destroy()
     }
   }, [localStream])
 
@@ -441,10 +342,15 @@ export default function BoothPage() {
         </div>
       )}
 
-      {(roomState === "connecting" || roomState === "connected" || roomState === "camera") && (
+      {(roomState === "connecting") && (
+        <div className="flex-1 flex items-center justify-center">
+          <p className="text-yellow-400 animate-pulse text-lg">Connecting to host...</p>
+        </div>
+      )}
+
+      {(roomState === "connected" || roomState === "camera") && (
         <div className="flex-1 flex items-center justify-center">
           <p className="text-yellow-400 animate-pulse text-lg">
-            {roomState === "connecting" && "Connecting to peer..."}
             {roomState === "connected" && "Starting camera..."}
             {roomState === "camera" && "Almost ready..."}
           </p>
