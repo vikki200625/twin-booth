@@ -1,22 +1,22 @@
 "use client"
 
-import { useParams } from "next/navigation"
+import { useParams, useSearchParams } from "next/navigation"
 import Link from "next/link"
 import { useState, useEffect, useRef } from "react"
 import { nanoid } from "nanoid"
 import Peer, { DataConnection } from "peerjs"
 import { getLocalStream, captureFrame, compositeImages, downloadBlob } from "@/lib/capture"
 import { uploadPhoto, deleteRoom } from "@/lib/storage"
+import { findRoom, joinRoom } from "@/lib/rooms"
 import WebcamFeed from "@/components/WebcamFeed"
 import FilterPicker from "@/components/FilterPicker"
 import Countdown from "@/components/Countdown"
 import Chat from "@/components/Chat"
 
 type RoomState =
-  | "lobby"
-  | "waiting"
   | "connecting"
-  | "connected"
+  | "waiting"
+  | "peer-connected"
   | "camera"
   | "ready"
   | "counting"
@@ -31,10 +31,12 @@ interface CapturedPhoto {
 
 export default function BoothPage() {
   const params = useParams()
+  const searchParams = useSearchParams()
   const roomId = params.id as string
+  const role = searchParams.get("role") as "host" | "guest"
+  const roomName = searchParams.get("name") || "Room"
 
-  const [role, setRole] = useState<"host" | "guest" | null>(null)
-  const [roomState, setRoomState] = useState<RoomState>("lobby")
+  const [roomState, setRoomState] = useState<RoomState>("connecting")
   const [copied, setCopied] = useState(false)
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
@@ -117,22 +119,10 @@ export default function BoothPage() {
   function handleMessage(data: Record<string, unknown>) {
     const type = data.type as string
 
-    if (type === "ready") {
-      setRoomState("ready")
-    }
-
-    if (type === "countdown") {
-      setCountingActive(true)
-    }
-
-    if (type === "snap") {
-      performCapture()
-    }
-
-    if (type === "photo") {
-      handlePhotoMessage(data as { photoIndex: number; imageData: string })
-    }
-
+    if (type === "ready") setRoomState("ready")
+    if (type === "countdown") setCountingActive(true)
+    if (type === "snap") performCapture()
+    if (type === "photo") handlePhotoMessage(data as { photoIndex: number; imageData: string })
     if (type === "chat") {
       setChatMessages((prev) => [...prev, { sender: data.sender as string, text: data.text as string, timestamp: data.timestamp as number }])
     }
@@ -154,10 +144,7 @@ export default function BoothPage() {
     setRoomState("snapping")
     performCapture()
     send({ type: "snap" })
-
-    setTimeout(() => {
-      setRoomState("ready")
-    }, 1000)
+    setTimeout(() => setRoomState("ready"), 1000)
   }
 
   async function endSession() {
@@ -168,93 +155,89 @@ export default function BoothPage() {
     setPhotos([])
   }
 
-  // Host: create peer and wait for guest
+  // HOST: Create peer, store ID in DB, wait for guest
   useEffect(() => {
     if (role !== "host") return
 
-    const peer = new Peer(roomId, {
-      debug: 1,
-    })
+    const peerId = `twinbooth-${roomId}`
+    const peer = new Peer(peerId)
     peerRef.current = peer
 
-    peer.on("open", (id) => {
-      console.log("Host peer opened with id:", id)
+    peer.on("open", async (id) => {
+      console.log("Host peer ready:", id)
+      await joinRoom(roomId, id)
       setRoomState("waiting")
     })
 
     peer.on("connection", (conn) => {
-      console.log("Host received connection from guest")
+      console.log("Host: guest connected!", conn.peer)
       connRef.current = conn
 
       conn.on("open", () => {
-        console.log("Data connection opened (host side)")
-        setRoomState("connected")
+        console.log("Host: data channel open")
+        setRoomState("peer-connected")
       })
 
       conn.on("data", (data) => {
         handleMessage(data as Record<string, unknown>)
-      })
-
-      conn.on("close", () => {
-        console.log("Data connection closed (host side)")
       })
     })
 
     peer.on("error", (err) => {
       console.error("Host peer error:", err)
-      setError(`Connection error: ${err.message}`)
+      setError(`Error: ${err.message}`)
     })
 
-    return () => {
-      peer.destroy()
-    }
+    return () => { peer.destroy() }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role, roomId])
 
-  // Guest: connect to host
+  // GUEST: Find room, get host peer ID, connect
   useEffect(() => {
     if (role !== "guest") return
 
-    setRoomState("connecting")
+    async function connect() {
+      const room = await findRoom(roomName)
+      if (!room || !room.host_peer_id) {
+        setError("Room not ready. Host may not have joined yet. Try again in a moment.")
+        return
+      }
 
-    const peer = new Peer(undefined as unknown as string, {
-      debug: 1,
-    })
-    peerRef.current = peer
+      console.log("Guest: connecting to host:", room.host_peer_id)
 
-    peer.on("open", () => {
-      console.log("Guest peer opened, connecting to host:", roomId)
-      const conn = peer.connect(roomId, { reliable: true })
-      connRef.current = conn
+      const peer = new Peer()
+      peerRef.current = peer
 
-      conn.on("open", () => {
-        console.log("Data connection opened (guest side)")
-        setRoomState("connected")
+      peer.on("open", () => {
+        console.log("Guest peer ready, connecting to host...")
+        const conn = peer.connect(room.host_peer_id!, { reliable: true })
+        connRef.current = conn
+
+        conn.on("open", () => {
+          console.log("Guest: data channel open!")
+          setRoomState("peer-connected")
+        })
+
+        conn.on("data", (data) => {
+          handleMessage(data as Record<string, unknown>)
+        })
       })
 
-      conn.on("data", (data) => {
-        handleMessage(data as Record<string, unknown>)
+      peer.on("error", (err) => {
+        console.error("Guest peer error:", err)
+        setError(`Error: ${err.message}`)
       })
-
-      conn.on("close", () => {
-        console.log("Data connection closed (guest side)")
-      })
-    })
-
-    peer.on("error", (err) => {
-      console.error("Guest peer error:", err)
-      setError(`Connection error: ${err.message}`)
-    })
-
-    return () => {
-      peer.destroy()
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [role, roomId])
 
-  // Start camera when connected
+    connect()
+
+    return () => { peerRef.current?.destroy() }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role, roomName])
+
+  // Start camera when peer connected
   useEffect(() => {
-    if (roomState !== "connected") return
+    if (roomState !== "peer-connected") return
 
     async function startCamera() {
       try {
@@ -275,7 +258,7 @@ export default function BoothPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomState])
 
-  // Cleanup on unmount
+  // Cleanup
   useEffect(() => {
     return () => {
       localStream?.getTracks().forEach((t) => t.stop())
@@ -283,7 +266,9 @@ export default function BoothPage() {
     }
   }, [localStream])
 
-  const shareLink = typeof window !== "undefined" ? window.location.href : ""
+  const shareLink = typeof window !== "undefined"
+    ? `${window.location.origin}?autojoin=${encodeURIComponent(roomName)}`
+    : ""
 
   function copyLink() {
     navigator.clipboard.writeText(shareLink)
@@ -295,6 +280,7 @@ export default function BoothPage() {
     <main className="flex-1 flex flex-col p-4">
       <h1 className="text-xl font-bold text-center mb-4">
         twin<span className="text-pink-500">booth</span>
+        <span className="text-gray-500 text-sm ml-2">| {roomName}</span>
       </h1>
 
       {error && (
@@ -303,57 +289,38 @@ export default function BoothPage() {
         </div>
       )}
 
-      {roomState === "lobby" && (
-        <div className="flex-1 flex flex-col items-center justify-center space-y-6">
-          <p className="text-gray-400 text-lg">How are you joining?</p>
-          <div className="flex gap-4">
-            <button
-              onClick={() => setRole("host")}
-              className="px-8 py-4 bg-pink-500 hover:bg-pink-600 rounded-xl font-semibold text-lg transition-colors cursor-pointer"
-            >
-              I&apos;m hosting
-            </button>
-            <button
-              onClick={() => setRole("guest")}
-              className="px-8 py-4 bg-gray-700 hover:bg-gray-600 rounded-xl font-semibold text-lg transition-colors cursor-pointer"
-            >
-              I&apos;m joining
-            </button>
-          </div>
+      {roomState === "connecting" && (
+        <div className="flex-1 flex items-center justify-center">
+          <p className="text-yellow-400 animate-pulse text-lg">Setting up room...</p>
         </div>
       )}
 
       {roomState === "waiting" && (
         <div className="flex-1 flex flex-col items-center justify-center space-y-6">
-          <p className="text-gray-400">Share this link with your friend:</p>
-          <div
-            onClick={copyLink}
-            className="bg-gray-800 px-4 py-3 rounded-lg font-mono text-sm break-all cursor-pointer hover:bg-gray-700 transition-colors max-w-md"
-          >
-            {shareLink}
+          <p className="text-gray-400">Tell your friend to join:</p>
+          <div className="bg-gray-800 px-4 py-3 rounded-lg text-center space-y-2">
+            <p className="text-white font-semibold">Room: {roomName}</p>
+            <p className="text-gray-400 text-sm">Search for &quot;{roomName}&quot; and enter the password</p>
           </div>
           <button
             onClick={copyLink}
             className="text-sm text-pink-400 hover:text-pink-300 cursor-pointer"
           >
-            {copied ? "Copied!" : "Click to copy link"}
+            {copied ? "Copied!" : "Or share this link"}
           </button>
           <p className="text-gray-500 animate-pulse">Waiting for friend to join...</p>
         </div>
       )}
 
-      {(roomState === "connecting") && (
+      {roomState === "peer-connected" && (
         <div className="flex-1 flex items-center justify-center">
-          <p className="text-yellow-400 animate-pulse text-lg">Connecting to host...</p>
+          <p className="text-green-400 animate-pulse text-lg">Friend connected! Starting camera...</p>
         </div>
       )}
 
-      {(roomState === "connected" || roomState === "camera") && (
+      {roomState === "camera" && (
         <div className="flex-1 flex items-center justify-center">
-          <p className="text-yellow-400 animate-pulse text-lg">
-            {roomState === "connected" && "Starting camera..."}
-            {roomState === "camera" && "Almost ready..."}
-          </p>
+          <p className="text-yellow-400 animate-pulse text-lg">Almost ready...</p>
         </div>
       )}
 
@@ -403,11 +370,7 @@ export default function BoothPage() {
           <div className="grid gap-4 max-w-2xl mx-auto">
             {photos.map((photo) => (
               <div key={photo.index} className="flex flex-col items-center gap-2">
-                <img
-                  src={photo.url}
-                  alt={`Photo ${photo.index + 1}`}
-                  className="rounded-lg w-full"
-                />
+                <img src={photo.url} alt={`Photo ${photo.index + 1}`} className="rounded-lg w-full" />
                 <button
                   onClick={() => downloadBlob(photo.blob, `twin-booth-${photo.index + 1}.jpg`)}
                   className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors cursor-pointer"
@@ -423,12 +386,9 @@ export default function BoothPage() {
       {roomState === "done" && (
         <div className="flex-1 flex flex-col items-center justify-center space-y-4">
           <p className="text-xl text-gray-300">Session ended</p>
-          <p className="text-gray-500">All photos have been deleted from the server.</p>
-          <Link
-            href="/"
-            className="px-6 py-3 bg-pink-500 hover:bg-pink-600 rounded-xl font-semibold transition-colors"
-          >
-            Create New Booth
+          <p className="text-gray-500">All photos have been deleted.</p>
+          <Link href="/" className="px-6 py-3 bg-pink-500 hover:bg-pink-600 rounded-xl font-semibold transition-colors">
+            Create New Room
           </Link>
         </div>
       )}
