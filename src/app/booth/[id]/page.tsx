@@ -285,7 +285,7 @@ export default function BoothPage() {
     setRoomState("connecting")
 
     const checkSubscribed = setInterval(() => {
-      if (channel.state === "subscribed") {
+      if ((channel.state as string) === "subscribed") {
         clearInterval(checkSubscribed)
         broadcastSignal(channel, { type: "join", role: "guest" })
       }
@@ -348,7 +348,9 @@ export default function BoothPage() {
       setRoomState("connecting")
     }
 
-    return () => channel.unsubscribe()
+    return () => {
+      channel.unsubscribe()
+    }
   }, [role, roomState, roomId, handleSignal])
 
   // Cleanup on unmount
