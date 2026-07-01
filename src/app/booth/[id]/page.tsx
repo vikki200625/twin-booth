@@ -4,7 +4,7 @@ import { useParams, useSearchParams } from "next/navigation"
 import Link from "next/link"
 import { useState, useEffect, useRef } from "react"
 import { nanoid } from "nanoid"
-import Peer, { DataConnection } from "peerjs"
+import Peer, { DataConnection, MediaConnection } from "peerjs"
 import { getLocalStream, captureFrame, compositeImages, downloadBlob } from "@/lib/capture"
 import { uploadPhoto, deleteRoom } from "@/lib/storage"
 import { findRoom, joinRoom } from "@/lib/rooms"
@@ -50,6 +50,7 @@ export default function BoothPage() {
 
   const peerRef = useRef<Peer | null>(null)
   const connRef = useRef<DataConnection | null>(null)
+  const pendingCallRef = useRef<MediaConnection | null>(null)
   const photoIndexRef = useRef(photoIndex)
   photoIndexRef.current = photoIndex
   const localFilterRef = useRef(localFilter)
@@ -185,13 +186,16 @@ export default function BoothPage() {
 
     peer.on("call", (call) => {
       console.log("Host: receiving call from guest")
-      if (localStream) {
-        call.answer(localStream)
-      }
       call.on("stream", (stream) => {
         console.log("Host: received guest stream")
         setRemoteStream(stream)
       })
+      if (localStream) {
+        call.answer(localStream)
+      } else {
+        console.log("Host: camera not ready yet, queuing call")
+        pendingCallRef.current = call
+      }
     })
 
     peer.on("error", (err) => {
@@ -253,13 +257,16 @@ export default function BoothPage() {
 
       peer.on("call", (call) => {
         console.log("Guest: receiving call from host")
-        if (localStream) {
-          call.answer(localStream)
-        }
         call.on("stream", (stream) => {
           console.log("Guest: received host stream")
           setRemoteStream(stream)
         })
+        if (localStream) {
+          call.answer(localStream)
+        } else {
+          console.log("Guest: camera not ready yet, queuing call")
+          pendingCallRef.current = call
+        }
       })
 
       peer.on("error", (err) => {
@@ -289,6 +296,14 @@ export default function BoothPage() {
         const stream = await getLocalStream()
         setLocalStream(stream)
 
+        // Answer any pending call from the peer
+        if (pendingCallRef.current) {
+          console.log("Answering pending call with new stream")
+          pendingCallRef.current.answer(stream)
+          pendingCallRef.current = null
+        }
+
+        // Call the peer to send our stream
         if (peerRef.current && connRef.current) {
           const call = peerRef.current.call(connRef.current.peer, stream)
           if (call) {
