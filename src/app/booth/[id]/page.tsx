@@ -11,10 +11,11 @@ import {
   handleOffer,
   handleAnswer,
 } from "@/lib/webrtc"
-import { getLocalStream } from "@/lib/capture"
+import { getLocalStream, captureFrame, compositeImages, downloadBlob } from "@/lib/capture"
 import { RealtimeChannel } from "@supabase/supabase-js"
 import WebcamFeed from "@/components/WebcamFeed"
 import FilterPicker from "@/components/FilterPicker"
+import Countdown from "@/components/Countdown"
 
 type RoomState =
   | "lobby"
@@ -27,6 +28,12 @@ type RoomState =
   | "snapping"
   | "done"
 
+interface CapturedPhoto {
+  index: number
+  blob: Blob
+  url: string
+}
+
 export default function BoothPage() {
   const params = useParams()
   const roomId = params.id as string
@@ -38,11 +45,22 @@ export default function BoothPage() {
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [localFilter, setLocalFilter] = useState("none")
+  const [countingActive, setCountingActive] = useState(false)
+  const [photos, setPhotos] = useState<CapturedPhoto[]>([])
+  const [photoIndex, setPhotoIndex] = useState(0)
 
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
   const dataChannelRef = useRef<RTCDataChannel | null>(null)
   const pendingCandidatesRef = useRef<RTCIceCandidate[]>([])
+  const localVideoRef = useRef<HTMLVideoElement | null>(null)
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
+
+  function sendData(msg: SignalMessage) {
+    if (dataChannelRef.current?.readyState === "open") {
+      dataChannelRef.current.send(JSON.stringify(msg))
+    }
+  }
 
   const handleSignal = useCallback(
     async (msg: SignalMessage) => {
@@ -55,8 +73,7 @@ export default function BoothPage() {
         }
 
         handleDataChannel(pc, (data) => {
-          const parsed = JSON.parse(data)
-          handleDataMessage(parsed)
+          handleDataMessage(JSON.parse(data))
         })
 
         const answer = await handleOffer(pc, msg.sdp)
@@ -99,14 +116,101 @@ export default function BoothPage() {
       if (msg.type === "ready") {
         setRoomState("ready")
       }
+
+      if (msg.type === "countdown") {
+        setCountingActive(true)
+      }
+
+      if (msg.type === "snap") {
+        performCapture()
+      }
+
+      if (msg.type === "photo") {
+        const binary = atob(msg.imageData)
+        const bytes = new Uint8Array(binary.length)
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i)
+        }
+        const blob = new Blob([bytes], { type: "image/jpeg" })
+        const localBlob = await captureLocalFrame()
+        if (localBlob) {
+          const composite = await compositeImages(localBlob, blob)
+          const idx = msg.photoIndex
+          setPhotos((prev) => [...prev, { index: idx, blob: composite, url: URL.createObjectURL(composite) }])
+          setPhotoIndex(idx + 1)
+        }
+        setCountingActive(false)
+      }
     },
     [role]
   )
+
+  async function captureLocalFrame(): Promise<Blob | null> {
+    const videoEl = document.querySelector('video')
+    if (!videoEl) return null
+    return captureFrame(videoEl as HTMLVideoElement, localFilter !== "none" ? localFilter : undefined)
+  }
+
+  async function performCapture() {
+    const localBlob = await captureLocalFrame()
+    if (!localBlob) return
+
+    const reader = new FileReader()
+    reader.onload = () => {
+      const base64 = (reader.result as string).split(",")[1]
+      sendData({
+        type: "photo",
+        photoIndex: photoIndex,
+        imageData: base64,
+      })
+    }
+    reader.readAsDataURL(localBlob)
+  }
 
   function handleDataMessage(msg: SignalMessage) {
     if (msg.type === "ready") {
       setRoomState("ready")
     }
+    if (msg.type === "countdown") {
+      setCountingActive(true)
+    }
+    if (msg.type === "snap") {
+      performCapture()
+    }
+    if (msg.type === "photo") {
+      const binary = atob(msg.imageData)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i)
+      }
+      const blob = new Blob([bytes], { type: "image/jpeg" })
+      captureLocalFrame().then((localBlob) => {
+        if (localBlob) {
+          compositeImages(localBlob, blob).then((composite) => {
+            const idx = msg.photoIndex
+            setPhotos((prev) => [...prev, { index: idx, blob: composite, url: URL.createObjectURL(composite) }])
+            setPhotoIndex(idx + 1)
+          })
+        }
+      })
+      setCountingActive(false)
+    }
+  }
+
+  function handleSnap() {
+    setCountingActive(true)
+    sendData({ type: "countdown", value: 3 })
+  }
+
+  function handleCountdownComplete() {
+    setCountingActive(false)
+    setRoomState("snapping")
+    performCapture()
+    sendData({ type: "snap" })
+
+    setTimeout(() => {
+      setRoomState("ready")
+    }, 1000)
   }
 
   // Start camera when connected
@@ -293,11 +397,49 @@ export default function BoothPage() {
       {(roomState === "ready" || roomState === "counting" || roomState === "snapping" || roomState === "done") && (
         <div className="flex-1 flex flex-col items-center gap-4">
           <FilterPicker selected={localFilter} onSelect={setLocalFilter} />
-          <div className="grid grid-cols-2 gap-2 w-full max-w-2xl">
+
+          <div className="relative grid grid-cols-2 gap-2 w-full max-w-2xl">
             <WebcamFeed stream={localStream} label="You" filter={localFilter} />
             <WebcamFeed stream={remoteStream} label="Friend" />
+            <Countdown active={countingActive} onComplete={handleCountdownComplete} />
           </div>
-          <p className="text-green-400">Both cameras live! Snap feature coming next...</p>
+
+          {role === "host" && (
+            <button
+              onClick={handleSnap}
+              disabled={countingActive || roomState === "snapping"}
+              className="px-8 py-4 bg-pink-500 hover:bg-pink-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-xl font-semibold text-lg transition-colors cursor-pointer"
+            >
+              {countingActive ? "Wait..." : "Snap!"}
+            </button>
+          )}
+
+          {role === "guest" && (
+            <p className="text-gray-400 text-sm">Waiting for host to snap...</p>
+          )}
+        </div>
+      )}
+
+      {photos.length > 0 && (
+        <div className="mt-8 space-y-4">
+          <h2 className="text-lg font-semibold text-center">Gallery</h2>
+          <div className="grid gap-4 max-w-2xl mx-auto">
+            {photos.map((photo) => (
+              <div key={photo.index} className="flex flex-col items-center gap-2">
+                <img
+                  src={photo.url}
+                  alt={`Photo ${photo.index + 1}`}
+                  className="rounded-lg w-full"
+                />
+                <button
+                  onClick={() => downloadBlob(photo.blob, `twin-booth-${photo.index + 1}.jpg`)}
+                  className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors cursor-pointer"
+                >
+                  Download Photo {photo.index + 1}
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </main>
