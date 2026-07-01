@@ -26,7 +26,8 @@ export default function Countdown({ active, onComplete }: CountdownProps) {
     }, 1000)
 
     return () => clearTimeout(timer)
-  }, [active, value, onComplete])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, value])
 
   if (!active || value === 0) return null
 

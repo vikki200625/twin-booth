@@ -19,7 +19,7 @@ export default function Home() {
         </h1>
 
         <p className="text-lg text-gray-400 leading-relaxed">
-          Take photos together, even when you're apart.
+          Take photos together, even when you&apos;re apart.
           <br />
           Two screens. One moment. Shared memories.
         </p>

@@ -1,6 +1,7 @@
 "use client"
 
 import { useParams } from "next/navigation"
+import Link from "next/link"
 import { useState, useEffect, useRef, useCallback } from "react"
 import { nanoid } from "nanoid"
 import { createRoomChannel, broadcastSignal, SignalMessage } from "@/lib/signaling"
@@ -58,8 +59,6 @@ export default function BoothPage() {
   const channelRef = useRef<RealtimeChannel | null>(null)
   const dataChannelRef = useRef<RTCDataChannel | null>(null)
   const pendingCandidatesRef = useRef<RTCIceCandidate[]>([])
-  const localVideoRef = useRef<HTMLVideoElement | null>(null)
-  const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
 
   function sendData(msg: SignalMessage) {
     if (dataChannelRef.current?.readyState === "open") {
@@ -282,7 +281,6 @@ export default function BoothPage() {
 
     const channel = createRoomChannel(roomId, handleSignal)
     channelRef.current = channel
-    setRoomState("connecting")
 
     const checkSubscribed = setInterval(() => {
       if ((channel.state as string) === "subscribed") {
@@ -393,7 +391,7 @@ export default function BoothPage() {
               I&apos;m hosting
             </button>
             <button
-              onClick={() => setRole("guest")}
+              onClick={() => { setRole("guest"); setRoomState("connecting") }}
               className="px-8 py-4 bg-gray-700 hover:bg-gray-600 rounded-xl font-semibold text-lg transition-colors cursor-pointer"
             >
               I&apos;m joining
@@ -498,12 +496,12 @@ export default function BoothPage() {
         <div className="flex-1 flex flex-col items-center justify-center space-y-4">
           <p className="text-xl text-gray-300">Session ended</p>
           <p className="text-gray-500">All photos have been deleted from the server.</p>
-          <a
+          <Link
             href="/"
             className="px-6 py-3 bg-pink-500 hover:bg-pink-600 rounded-xl font-semibold transition-colors"
           >
             Create New Booth
-          </a>
+          </Link>
         </div>
       )}
     </main>
