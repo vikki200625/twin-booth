@@ -14,6 +14,7 @@ import {
 import { getLocalStream } from "@/lib/capture"
 import { RealtimeChannel } from "@supabase/supabase-js"
 import WebcamFeed from "@/components/WebcamFeed"
+import FilterPicker from "@/components/FilterPicker"
 
 type RoomState =
   | "lobby"
@@ -36,6 +37,7 @@ export default function BoothPage() {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [localFilter, setLocalFilter] = useState("none")
 
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
@@ -290,8 +292,9 @@ export default function BoothPage() {
 
       {(roomState === "ready" || roomState === "counting" || roomState === "snapping" || roomState === "done") && (
         <div className="flex-1 flex flex-col items-center gap-4">
+          <FilterPicker selected={localFilter} onSelect={setLocalFilter} />
           <div className="grid grid-cols-2 gap-2 w-full max-w-2xl">
-            <WebcamFeed stream={localStream} label="You" />
+            <WebcamFeed stream={localStream} label="You" filter={localFilter} />
             <WebcamFeed stream={remoteStream} label="Friend" />
           </div>
           <p className="text-green-400">Both cameras live! Snap feature coming next...</p>
