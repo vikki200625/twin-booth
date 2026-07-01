@@ -2,9 +2,9 @@
 
 import { useParams, useSearchParams } from "next/navigation"
 import Link from "next/link"
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
 import { nanoid } from "nanoid"
-import Peer, { DataConnection, MediaConnection } from "peerjs"
+import Peer, { DataConnection } from "peerjs"
 import { getLocalStream, captureFrame, compositeImages, downloadBlob } from "@/lib/capture"
 import { uploadPhoto, deleteRoom } from "@/lib/storage"
 import { findRoom, joinRoom } from "@/lib/rooms"
@@ -17,7 +17,6 @@ type RoomState =
   | "connecting"
   | "waiting"
   | "peer-connected"
-  | "camera"
   | "ready"
   | "counting"
   | "snapping"
@@ -44,15 +43,13 @@ export default function BoothPage() {
   const [localFilter, setLocalFilter] = useState("none")
   const [countingActive, setCountingActive] = useState(false)
   const [photos, setPhotos] = useState<CapturedPhoto[]>([])
-  const [photoIndex, setPhotoIndex] = useState(0)
   const [chatMessages, setChatMessages] = useState<{ sender: string; text: string; timestamp: number }[]>([])
   const [myId] = useState(() => nanoid(8))
 
   const peerRef = useRef<Peer | null>(null)
   const connRef = useRef<DataConnection | null>(null)
-  const pendingCallRef = useRef<MediaConnection | null>(null)
-  const photoIndexRef = useRef(photoIndex)
-  photoIndexRef.current = photoIndex
+  const localStreamRef = useRef<MediaStream | null>(null)
+  const remoteStreamRef = useRef<MediaStream | null>(null)
   const localFilterRef = useRef(localFilter)
   localFilterRef.current = localFilter
 
@@ -62,38 +59,43 @@ export default function BoothPage() {
     }
   }
 
-  async function captureLocalFrame(): Promise<Blob | null> {
-    const videoEl = document.querySelector('video')
-    if (!videoEl) return null
+  const captureRemoteFrame = useCallback((): Promise<Blob | null> => {
+    const videos = document.querySelectorAll('video')
+    const remoteVideo = videos[1] as HTMLVideoElement | undefined
+    if (!remoteVideo || !remoteVideo.srcObject) return Promise.resolve(null)
+    return captureFrame(remoteVideo)
+  }, [])
+
+  const captureLocalFrame = useCallback((): Promise<Blob | null> => {
+    const videos = document.querySelectorAll('video')
+    const localVideo = videos[0] as HTMLVideoElement | undefined
+    if (!localVideo) return Promise.resolve(null)
     const filter = localFilterRef.current !== "none" ? localFilterRef.current : undefined
-    return captureFrame(videoEl as HTMLVideoElement, filter)
-  }
+    return captureFrame(localVideo, filter)
+  }, [])
 
   async function performCapture() {
     const localBlob = await captureLocalFrame()
     if (!localBlob) return
 
-    const idx = photoIndexRef.current
-    const reader = new FileReader()
-    reader.onload = async () => {
-      const base64 = (reader.result as string).split(",")[1]
+    const idx = (photos.length)
 
-      const binary = atob(base64)
-      const bytes = new Uint8Array(binary.length)
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i)
-      }
-      const remoteBlob = new Blob([bytes], { type: "image/jpeg" })
+    const remoteBlob = await captureRemoteFrame()
 
+    if (remoteBlob) {
       const composite = await compositeImages(localBlob, remoteBlob)
       const uploadedUrl = await uploadPhoto(roomId, idx, composite)
       setPhotos((prev) => [
         ...prev,
         { index: idx, blob: composite, url: uploadedUrl || URL.createObjectURL(composite) },
       ])
-      setPhotoIndex(idx + 1)
+    } else {
+      const uploadedUrl = await uploadPhoto(roomId, idx, localBlob)
+      setPhotos((prev) => [
+        ...prev,
+        { index: idx, blob: localBlob, url: uploadedUrl || URL.createObjectURL(localBlob) },
+      ])
     }
-    reader.readAsDataURL(localBlob)
   }
 
   async function handlePhotoMessage(msg: { photoIndex: number; imageData: string }) {
@@ -106,13 +108,11 @@ export default function BoothPage() {
     const localBlob = await captureLocalFrame()
     if (localBlob) {
       const composite = await compositeImages(localBlob, remoteBlob)
-      const idx = msg.photoIndex
-      const uploadedUrl = await uploadPhoto(roomId, idx, composite)
+      const uploadedUrl = await uploadPhoto(roomId, msg.photoIndex, composite)
       setPhotos((prev) => [
         ...prev,
-        { index: idx, blob: composite, url: uploadedUrl || URL.createObjectURL(composite) },
+        { index: msg.photoIndex, blob: composite, url: uploadedUrl || URL.createObjectURL(composite) },
       ])
-      setPhotoIndex(idx + 1)
     }
     setCountingActive(false)
   }
@@ -140,29 +140,59 @@ export default function BoothPage() {
     send({ type: "countdown", value: 3 })
   }
 
-  function handleCountdownComplete() {
+  async function handleCountdownComplete() {
     setCountingActive(false)
     setRoomState("snapping")
-    performCapture()
+    await performCapture()
     send({ type: "snap" })
     setTimeout(() => setRoomState("ready"), 1000)
   }
 
   async function endSession() {
     await deleteRoom(roomId)
-    localStream?.getTracks().forEach((t) => t.stop())
+    localStreamRef.current?.getTracks().forEach((t) => t.stop())
     peerRef.current?.destroy()
     setRoomState("done")
     setPhotos([])
   }
 
-  // HOST: Create peer, store ID in DB, wait for guest
+  function setupPeerCallbacks(peer: Peer) {
+    peer.on("call", (call) => {
+      console.log("Receiving call from peer")
+      call.on("stream", (stream) => {
+        console.log("Received remote stream")
+        remoteStreamRef.current = stream
+        setRemoteStream(stream)
+      })
+      call.on("close", () => {
+        console.log("Call closed")
+        remoteStreamRef.current = null
+        setRemoteStream(null)
+      })
+      const stream = localStreamRef.current
+      if (stream) {
+        console.log("Answering call with stream")
+        call.answer(stream)
+      } else {
+        console.log("No stream yet, answering without video")
+        call.answer()
+      }
+    })
+
+    peer.on("error", (err) => {
+      console.error("Peer error:", err)
+      setError(`Connection error: ${err.message}`)
+    })
+  }
+
   useEffect(() => {
     if (role !== "host") return
 
     const peerId = `twinbooth-${roomId}-${nanoid(6)}`
     const peer = new Peer(peerId)
     peerRef.current = peer
+
+    setupPeerCallbacks(peer)
 
     peer.on("open", async (id) => {
       console.log("Host peer ready:", id)
@@ -184,30 +214,10 @@ export default function BoothPage() {
       })
     })
 
-    peer.on("call", (call) => {
-      console.log("Host: receiving call from guest")
-      call.on("stream", (stream) => {
-        console.log("Host: received guest stream")
-        setRemoteStream(stream)
-      })
-      if (localStream) {
-        call.answer(localStream)
-      } else {
-        console.log("Host: camera not ready yet, queuing call")
-        pendingCallRef.current = call
-      }
-    })
-
-    peer.on("error", (err) => {
-      console.error("Host peer error:", err)
-      setError(`Error: ${err.message}`)
-    })
-
     return () => { peer.destroy() }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role, roomId])
 
-  // GUEST: Find room, get host peer ID, connect with retries
   useEffect(() => {
     if (role !== "guest") return
 
@@ -236,6 +246,8 @@ export default function BoothPage() {
       peer = new Peer()
       peerRef.current = peer
 
+      setupPeerCallbacks(peer)
+
       peer.on("open", () => {
         console.log("Guest peer ready, connecting to host...")
         const conn = peer!.connect(room.host_peer_id!, { reliable: true })
@@ -254,28 +266,6 @@ export default function BoothPage() {
           console.error("Guest connection error:", err)
         })
       })
-
-      peer.on("call", (call) => {
-        console.log("Guest: receiving call from host")
-        call.on("stream", (stream) => {
-          console.log("Guest: received host stream")
-          setRemoteStream(stream)
-        })
-        if (localStream) {
-          call.answer(localStream)
-        } else {
-          console.log("Guest: camera not ready yet, queuing call")
-          pendingCallRef.current = call
-        }
-      })
-
-      peer.on("error", (err) => {
-        console.error("Guest peer error:", err)
-        if (!cancelled) {
-          setError(`Connection failed: ${err.message}. Retrying...`)
-          setTimeout(tryConnect, 3000)
-        }
-      })
     }
 
     tryConnect()
@@ -287,28 +277,26 @@ export default function BoothPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role, roomName])
 
-  // Start camera when peer connected
   useEffect(() => {
     if (roomState !== "peer-connected") return
 
     async function startCamera() {
       try {
         const stream = await getLocalStream()
+        localStreamRef.current = stream
         setLocalStream(stream)
 
-        // Answer any pending call from the peer
-        if (pendingCallRef.current) {
-          console.log("Answering pending call with new stream")
-          pendingCallRef.current.answer(stream)
-          pendingCallRef.current = null
-        }
-
-        // Call the peer to send our stream
         if (peerRef.current && connRef.current) {
+          console.log("Calling peer with stream...")
           const call = peerRef.current.call(connRef.current.peer, stream)
           if (call) {
             call.on("stream", (remote) => {
+              console.log("Got remote stream from call")
+              remoteStreamRef.current = remote
               setRemoteStream(remote)
+            })
+            call.on("error", (err) => {
+              console.error("Call error:", err)
             })
           }
         }
@@ -317,7 +305,8 @@ export default function BoothPage() {
           send({ type: "ready" })
         }
         setRoomState("ready")
-      } catch {
+      } catch (err) {
+        console.error("Camera error:", err)
         setError("Camera access denied. Please allow camera permissions.")
       }
     }
@@ -326,13 +315,12 @@ export default function BoothPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomState])
 
-  // Cleanup
   useEffect(() => {
     return () => {
-      localStream?.getTracks().forEach((t) => t.stop())
+      localStreamRef.current?.getTracks().forEach((t) => t.stop())
       peerRef.current?.destroy()
     }
-  }, [localStream])
+  }, [])
 
   const shareLink = typeof window !== "undefined"
     ? `${window.location.origin}?autojoin=${encodeURIComponent(roomName)}`
@@ -383,12 +371,6 @@ export default function BoothPage() {
       {roomState === "peer-connected" && (
         <div className="flex-1 flex items-center justify-center">
           <p className="text-green-400 animate-pulse text-lg">Friend connected! Starting camera...</p>
-        </div>
-      )}
-
-      {roomState === "camera" && (
-        <div className="flex-1 flex items-center justify-center">
-          <p className="text-yellow-400 animate-pulse text-lg">Almost ready...</p>
         </div>
       )}
 
