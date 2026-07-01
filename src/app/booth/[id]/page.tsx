@@ -12,6 +12,7 @@ import {
   handleAnswer,
 } from "@/lib/webrtc"
 import { getLocalStream, captureFrame, compositeImages, downloadBlob } from "@/lib/capture"
+import { uploadPhoto } from "@/lib/storage"
 import { RealtimeChannel } from "@supabase/supabase-js"
 import WebcamFeed from "@/components/WebcamFeed"
 import FilterPicker from "@/components/FilterPicker"
@@ -136,13 +137,17 @@ export default function BoothPage() {
         if (localBlob) {
           const composite = await compositeImages(localBlob, blob)
           const idx = msg.photoIndex
-          setPhotos((prev) => [...prev, { index: idx, blob: composite, url: URL.createObjectURL(composite) }])
+          const uploadedUrl = await uploadPhoto(roomId, idx, composite)
+          setPhotos((prev) => [
+            ...prev,
+            { index: idx, blob: composite, url: uploadedUrl || URL.createObjectURL(composite) },
+          ])
           setPhotoIndex(idx + 1)
         }
         setCountingActive(false)
       }
     },
-    [role]
+    [role, roomId]
   )
 
   async function captureLocalFrame(): Promise<Blob | null> {
@@ -186,9 +191,13 @@ export default function BoothPage() {
       const blob = new Blob([bytes], { type: "image/jpeg" })
       captureLocalFrame().then((localBlob) => {
         if (localBlob) {
-          compositeImages(localBlob, blob).then((composite) => {
+          compositeImages(localBlob, blob).then(async (composite) => {
             const idx = msg.photoIndex
-            setPhotos((prev) => [...prev, { index: idx, blob: composite, url: URL.createObjectURL(composite) }])
+            const uploadedUrl = await uploadPhoto(roomId, idx, composite)
+            setPhotos((prev) => [
+              ...prev,
+              { index: idx, blob: composite, url: uploadedUrl || URL.createObjectURL(composite) },
+            ])
             setPhotoIndex(idx + 1)
           })
         }
