@@ -25,7 +25,7 @@ export default function WebcamFeed({ stream, label, filter }: WebcamFeedProps) {
         muted
         playsInline
         className="w-full h-full object-cover"
-        style={{ filter: filter || "none" }}
+        style={{ filter: filter || "none", transform: "scaleX(-1)" }}
       />
       <div className="absolute bottom-2 left-2 bg-black/60 px-2 py-1 rounded text-xs text-white">
         {label}
