@@ -183,6 +183,17 @@ export default function BoothPage() {
       })
     })
 
+    peer.on("call", (call) => {
+      console.log("Host: receiving call from guest")
+      if (localStream) {
+        call.answer(localStream)
+      }
+      call.on("stream", (stream) => {
+        console.log("Host: received guest stream")
+        setRemoteStream(stream)
+      })
+    })
+
     peer.on("error", (err) => {
       console.error("Host peer error:", err)
       setError(`Error: ${err.message}`)
@@ -240,6 +251,17 @@ export default function BoothPage() {
         })
       })
 
+      peer.on("call", (call) => {
+        console.log("Guest: receiving call from host")
+        if (localStream) {
+          call.answer(localStream)
+        }
+        call.on("stream", (stream) => {
+          console.log("Guest: received host stream")
+          setRemoteStream(stream)
+        })
+      })
+
       peer.on("error", (err) => {
         console.error("Guest peer error:", err)
         if (!cancelled) {
@@ -266,12 +288,20 @@ export default function BoothPage() {
       try {
         const stream = await getLocalStream()
         setLocalStream(stream)
-        setRoomState("camera")
+
+        if (peerRef.current && connRef.current) {
+          const call = peerRef.current.call(connRef.current.peer, stream)
+          if (call) {
+            call.on("stream", (remote) => {
+              setRemoteStream(remote)
+            })
+          }
+        }
 
         if (role === "host") {
           send({ type: "ready" })
-          setRoomState("ready")
         }
+        setRoomState("ready")
       } catch {
         setError("Camera access denied. Please allow camera permissions.")
       }
