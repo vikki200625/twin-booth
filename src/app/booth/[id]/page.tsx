@@ -2,6 +2,7 @@
 
 import { useParams } from "next/navigation"
 import { useState, useEffect, useRef, useCallback } from "react"
+import { nanoid } from "nanoid"
 import { createRoomChannel, broadcastSignal, SignalMessage } from "@/lib/signaling"
 import {
   createPeerConnection,
@@ -17,6 +18,7 @@ import { RealtimeChannel } from "@supabase/supabase-js"
 import WebcamFeed from "@/components/WebcamFeed"
 import FilterPicker from "@/components/FilterPicker"
 import Countdown from "@/components/Countdown"
+import Chat from "@/components/Chat"
 
 type RoomState =
   | "lobby"
@@ -49,6 +51,8 @@ export default function BoothPage() {
   const [countingActive, setCountingActive] = useState(false)
   const [photos, setPhotos] = useState<CapturedPhoto[]>([])
   const [photoIndex, setPhotoIndex] = useState(0)
+  const [chatMessages, setChatMessages] = useState<{ sender: string; text: string; timestamp: number }[]>([])
+  const [myId] = useState(() => nanoid(8))
 
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
@@ -146,6 +150,10 @@ export default function BoothPage() {
         }
         setCountingActive(false)
       }
+
+      if (msg.type === "chat") {
+        setChatMessages((prev) => [...prev, { sender: msg.sender, text: msg.text, timestamp: msg.timestamp }])
+      }
     },
     [role, roomId]
   )
@@ -204,6 +212,9 @@ export default function BoothPage() {
       })
       setCountingActive(false)
     }
+    if (msg.type === "chat") {
+      setChatMessages((prev) => [...prev, { sender: msg.sender, text: msg.text, timestamp: msg.timestamp }])
+    }
   }
 
   function handleSnap() {
@@ -220,6 +231,12 @@ export default function BoothPage() {
     setTimeout(() => {
       setRoomState("ready")
     }, 1000)
+  }
+
+  function sendChat(text: string) {
+    const msg = { type: "chat" as const, sender: myId, text, timestamp: Date.now() }
+    sendData(msg)
+    setChatMessages((prev) => [...prev, { sender: myId, text, timestamp: Date.now() }])
   }
 
   // Start camera when connected
@@ -404,28 +421,34 @@ export default function BoothPage() {
       )}
 
       {(roomState === "ready" || roomState === "counting" || roomState === "snapping" || roomState === "done") && (
-        <div className="flex-1 flex flex-col items-center gap-4">
-          <FilterPicker selected={localFilter} onSelect={setLocalFilter} />
+        <div className="flex-1 flex flex-col lg:flex-row gap-4 items-start">
+          <div className="flex-1 flex flex-col items-center gap-4 w-full">
+            <FilterPicker selected={localFilter} onSelect={setLocalFilter} />
 
-          <div className="relative grid grid-cols-2 gap-2 w-full max-w-2xl">
-            <WebcamFeed stream={localStream} label="You" filter={localFilter} />
-            <WebcamFeed stream={remoteStream} label="Friend" />
-            <Countdown active={countingActive} onComplete={handleCountdownComplete} />
+            <div className="relative grid grid-cols-2 gap-2 w-full max-w-2xl">
+              <WebcamFeed stream={localStream} label="You" filter={localFilter} />
+              <WebcamFeed stream={remoteStream} label="Friend" />
+              <Countdown active={countingActive} onComplete={handleCountdownComplete} />
+            </div>
+
+            {role === "host" && (
+              <button
+                onClick={handleSnap}
+                disabled={countingActive || roomState === "snapping"}
+                className="px-8 py-4 bg-pink-500 hover:bg-pink-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-xl font-semibold text-lg transition-colors cursor-pointer"
+              >
+                {countingActive ? "Wait..." : "Snap!"}
+              </button>
+            )}
+
+            {role === "guest" && (
+              <p className="text-gray-400 text-sm">Waiting for host to snap...</p>
+            )}
           </div>
 
-          {role === "host" && (
-            <button
-              onClick={handleSnap}
-              disabled={countingActive || roomState === "snapping"}
-              className="px-8 py-4 bg-pink-500 hover:bg-pink-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-xl font-semibold text-lg transition-colors cursor-pointer"
-            >
-              {countingActive ? "Wait..." : "Snap!"}
-            </button>
-          )}
-
-          {role === "guest" && (
-            <p className="text-gray-400 text-sm">Waiting for host to snap...</p>
-          )}
+          <div className="w-full lg:w-80 h-96 lg:h-[500px] border border-gray-700 rounded-xl overflow-hidden">
+            <Chat onSend={sendChat} messages={chatMessages} myId={myId} />
+          </div>
         </div>
       )}
 
