@@ -192,25 +192,38 @@ export default function BoothPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role, roomId])
 
-  // GUEST: Find room, get host peer ID, connect
+  // GUEST: Find room, get host peer ID, connect with retries
   useEffect(() => {
     if (role !== "guest") return
 
-    async function connect() {
+    let cancelled = false
+    let peer: Peer | null = null
+    let retryCount = 0
+    const maxRetries = 15
+
+    async function tryConnect() {
+      if (cancelled) return
+
       const room = await findRoom(roomName)
       if (!room || !room.host_peer_id) {
-        setError("Room not ready. Host may not have joined yet. Try again in a moment.")
+        retryCount++
+        if (retryCount < maxRetries && !cancelled) {
+          console.log(`Guest: room not ready yet, retry ${retryCount}/${maxRetries}...`)
+          setTimeout(tryConnect, 2000)
+        } else if (!cancelled) {
+          setError("Host not found. Make sure the host has created the room and is waiting.")
+        }
         return
       }
 
-      console.log("Guest: connecting to host:", room.host_peer_id)
+      console.log("Guest: found host peer ID:", room.host_peer_id)
 
-      const peer = new Peer()
+      peer = new Peer()
       peerRef.current = peer
 
       peer.on("open", () => {
         console.log("Guest peer ready, connecting to host...")
-        const conn = peer.connect(room.host_peer_id!, { reliable: true })
+        const conn = peer!.connect(room.host_peer_id!, { reliable: true })
         connRef.current = conn
 
         conn.on("open", () => {
@@ -221,17 +234,27 @@ export default function BoothPage() {
         conn.on("data", (data) => {
           handleMessage(data as Record<string, unknown>)
         })
+
+        conn.on("error", (err) => {
+          console.error("Guest connection error:", err)
+        })
       })
 
       peer.on("error", (err) => {
         console.error("Guest peer error:", err)
-        setError(`Error: ${err.message}`)
+        if (!cancelled) {
+          setError(`Connection failed: ${err.message}. Retrying...`)
+          setTimeout(tryConnect, 3000)
+        }
       })
     }
 
-    connect()
+    tryConnect()
 
-    return () => { peerRef.current?.destroy() }
+    return () => {
+      cancelled = true
+      peer?.destroy()
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [role, roomName])
 
