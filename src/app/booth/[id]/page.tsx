@@ -159,7 +159,7 @@ export default function BoothPage() {
   useEffect(() => {
     if (role !== "host") return
 
-    const peerId = `twinbooth-${roomId}`
+    const peerId = `twinbooth-${roomId}-${nanoid(6)}`
     const peer = new Peer(peerId)
     peerRef.current = peer
 
