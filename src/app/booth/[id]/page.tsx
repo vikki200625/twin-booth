@@ -13,7 +13,7 @@ import {
   handleAnswer,
 } from "@/lib/webrtc"
 import { getLocalStream, captureFrame, compositeImages, downloadBlob } from "@/lib/capture"
-import { uploadPhoto } from "@/lib/storage"
+import { uploadPhoto, deleteRoom } from "@/lib/storage"
 import { RealtimeChannel } from "@supabase/supabase-js"
 import WebcamFeed from "@/components/WebcamFeed"
 import FilterPicker from "@/components/FilterPicker"
@@ -239,6 +239,15 @@ export default function BoothPage() {
     setChatMessages((prev) => [...prev, { sender: myId, text, timestamp: Date.now() }])
   }
 
+  async function endSession() {
+    await deleteRoom(roomId)
+    localStream?.getTracks().forEach((t) => t.stop())
+    pcRef.current?.close()
+    channelRef.current?.unsubscribe()
+    setRoomState("done")
+    setPhotos([])
+  }
+
   // Start camera when connected
   useEffect(() => {
     if (roomState !== "connected") return
@@ -432,13 +441,21 @@ export default function BoothPage() {
             </div>
 
             {role === "host" && (
-              <button
-                onClick={handleSnap}
-                disabled={countingActive || roomState === "snapping"}
-                className="px-8 py-4 bg-pink-500 hover:bg-pink-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-xl font-semibold text-lg transition-colors cursor-pointer"
-              >
-                {countingActive ? "Wait..." : "Snap!"}
-              </button>
+              <div className="flex gap-3">
+                <button
+                  onClick={handleSnap}
+                  disabled={countingActive || roomState === "snapping"}
+                  className="px-8 py-4 bg-pink-500 hover:bg-pink-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-xl font-semibold text-lg transition-colors cursor-pointer"
+                >
+                  {countingActive ? "Wait..." : "Snap!"}
+                </button>
+                <button
+                  onClick={endSession}
+                  className="px-6 py-4 bg-red-600 hover:bg-red-700 rounded-xl font-semibold text-lg transition-colors cursor-pointer"
+                >
+                  End Session
+                </button>
+              </div>
             )}
 
             {role === "guest" && (
@@ -472,6 +489,19 @@ export default function BoothPage() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {roomState === "done" && (
+        <div className="flex-1 flex flex-col items-center justify-center space-y-4">
+          <p className="text-xl text-gray-300">Session ended</p>
+          <p className="text-gray-500">All photos have been deleted from the server.</p>
+          <a
+            href="/"
+            className="px-6 py-3 bg-pink-500 hover:bg-pink-600 rounded-xl font-semibold transition-colors"
+          >
+            Create New Booth
+          </a>
         </div>
       )}
     </main>
